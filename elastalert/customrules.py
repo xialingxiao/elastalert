@@ -3,6 +3,7 @@ from ruletypes import *
 from collections import OrderedDict
 import json
 import unicodedata
+import pytz
 
 class CardinalityRule(RuleType):
     """ A rule that matches if max_cardinality of a field is reached within a timeframe """
@@ -52,7 +53,8 @@ class CardinalityRule(RuleType):
                 silentList.append(ele['term'])
         for ele in self.cardinalityWindow.content[key]:
             if ele['term'] not in silentList:
-                ctermList.append(ele['term'])
+                if not ele['alerted']:
+                    ctermList.append(ele['term'])
         ctermSet = set(ctermList)
         if len(ctermSet) >= self.rules['max_cardinality']:
             timenow = ts_now()
@@ -78,13 +80,14 @@ class CardinalityRule(RuleType):
         """
         # Convert datetime's back to timestamps
         if 'time' in match.keys():
-            match['time'] = dt_to_ts(match['time'])
+            match['time'] = utc_to_local(match['time'])
         self.matches.append(match)
 
     def tagAlerted(self,key,cardinality, timenow):
         for ele in self.cardinalityWindow.content[key]:
             if ele['term']==cardinality:
-                ele['alerted'] = timenow
+                if not ele['alerted']:
+                    ele['alerted'] = timenow
 
     def garbage_collect(self, timestamp):
         """ Remove all occurrence data that is beyond the timeframe away """
@@ -98,9 +101,9 @@ class CardinalityRule(RuleType):
         self.cardinalityWindow.write()
 
     def get_match_str(self, match):
-        lt = self.rules.get('use_local_time')
-        starttime = pretty_ts(dt_to_ts(ts_to_dt(match['time']) - self.rules['timeframe']), lt)
-        endtime = pretty_ts(match['time'], lt)
+        lt = True
+        starttime = pretty_dl_ts(ts_now() - self.rules['timeframe'], lt)
+        endtime = pretty_dl_ts(ts_now(), lt)
         if not self.rules['bucket_key']:
             message = 'A maximum cardinality of %d on %s has been reached since the last alert or between %s and %s\n\n' % (self.rules['max_cardinality'],self.rules['cardinality_term'],
                                                                          starttime,
@@ -125,6 +128,7 @@ class PeriodicReporter(RuleType):
         self.get_ts = lambda event: ts_to_dt(event[self.ts_field])
         self.recordWindow = jsonReportInterface(self.storage).load()
         self.recordWindow.content.setdefault('report_start',dt_to_ts(ts_now()))
+        self.recordWindow.content.setdefault('last_report','')
 
     def add_data(self, data):
         for event in data:
@@ -153,11 +157,23 @@ class PeriodicReporter(RuleType):
                             append = False
                     if append:
                         self.recordWindow.content['New User Registration(s) by Admin'].append(new_user)
+                elif str(event['msg'])=='Enqueued invite to org email':
+                    new_user = {}
+                    new_user['User']=event['user']
+                    new_user['Registration Time']=dt_to_ts(self.get_ts(event))
+                    new_user['Reported']=''
+                    self.recordWindow.content.setdefault('New User Invited by Existing User',[])
+                    append = True
+                    for ele in self.recordWindow.content['New User Invited by Existing User']:
+                        if ele['User']==new_user['User']:
+                            append = False
+                    if append:
+                        self.recordWindow.content['New User Invited by Existing User'].append(new_user)
                 elif str(event['msg'])=='Entitlement payment complete. Enqueued payment receipt email to purchaser':
                     new_user = {}
                     new_user['User']=event['purchased_by']
                     new_user['Subscription Time']=dt_to_ts(self.get_ts(event))
-                    new_user['Subscription Package']=event['item']
+                    new_user['Subscription Package']=event.setdefault('item','NOT SPECIFIED')
                     new_user['Reported']=''
                     self.recordWindow.content.setdefault('New Subscription(s)',[])
                     append = True
@@ -169,47 +185,58 @@ class PeriodicReporter(RuleType):
         self.check_for_match()
         self.recordWindow.write()
 
-    def stripeDomain(self,stringinput):
+    def stripDomain(self,stringinput):
         item = str(stringinput)
         item = item[:item.find('@')]
         return item
 
     def check_for_match(self):
         # Match if, after removing old events, we hit max_cardinality
-        if (ts_now()>ts_to_dt(self.recordWindow.content['report_start'])) and (ts_now()-ts_to_dt(self.recordWindow.content['report_start'])>self.rules['timeframe']):
+        tsnow = ts_now()
+        if (tsnow>ts_to_dt(self.recordWindow.content['report_start'])) and (tsnow-ts_to_dt(self.recordWindow.content['report_start'])>self.rules['timeframe']):
             report = OrderedDict()
             if 'New User Registration(s)' in self.recordWindow.content.keys():
                 for ele in self.recordWindow.content['New User Registration(s)']:
                     if not ele['Reported']:
                         item = OrderedDict()
                         item['User'] = ele['User']
-                        item['Registration Time'] = dt_to_ts(ele['Registration Time'])
+                        item['Registration Time'] = utc_to_local(ts_to_dt(ele['Registration Time']))
                         report.setdefault('New User Registration(s)',[]).append(item)
             if 'New User Registration(s) by Admin' in self.recordWindow.content.keys():
                 for ele in self.recordWindow.content['New User Registration(s) by Admin']:
                     if not ele['Reported']:
                         item = OrderedDict()
                         item['User'] = ele['User']
-                        item['Registration Time'] = dt_to_ts(ele['Registration Time'])
+                        item['Registration Time'] = utc_to_local(ts_to_dt(ele['Registration Time']))
                         report.setdefault('New User Registration(s) by Admin',[]).append(item)
+            if 'New User Invited by Existing User' in self.recordWindow.content.keys():
+                for ele in self.recordWindow.content['New User Invited by Existing User']:
+                    if not ele['Reported']:
+                        item = OrderedDict()
+                        item['User'] = ele['User']
+                        item['Registration Time'] = utc_to_local(ts_to_dt(ele['Registration Time']))
+                        report.setdefault('New User Invited by Existing User',[]).append(item)
             if 'New Subscription(s)' in self.recordWindow.content.keys():
                 for ele in self.recordWindow.content['New Subscription(s)']:
                     if not ele['Reported']:
                         item = OrderedDict()
                         item['User'] = ele['User']
-                        item['Subscription Time'] = dt_to_ts(ele['Subscription Time'])
+                        item['Subscription Time'] = utc_to_local(ts_to_dt(ele['Subscription Time']))
                         item['Subscription Package'] = ele['Subscription Package']
                         report.setdefault('New Subscription(s)',[]).append(item)
             if not report:
-                report['Message']='Nothing worth reporting happened... Dragon is quite starving, it needs some new blood desparately.'
-            while (ts_now()>ts_to_dt(self.recordWindow.content['report_start'])) and (ts_now()-ts_to_dt(self.recordWindow.content['report_start'])>self.rules['timeframe']):
+                report['Message']='Nothing worth reporting happened. Dragon is quite starving, new blood please!'
+            if self.recordWindow.content['last_report']:
+                report['Start Time']=self.recordWindow.content['last_report']
+            else:
+                report['Start Time']=self.recordWindow.content['report_start']
+            while (tsnow>ts_to_dt(self.recordWindow.content['report_start'])+self.rules['timeframe']) and (tsnow-ts_to_dt(self.recordWindow.content['report_start'])>self.rules['timeframe']):
                 self.recordWindow.content['report_start']=dt_to_ts(ts_to_dt(self.recordWindow.content['report_start'])+self.rules['timeframe'])
-            report['Time']=self.recordWindow.content['report_start']
-            
+            report['End Time']=dt_to_ts(tsnow)
             self.add_match(report)
-
+            self.recordWindow.content['last_report']=dt_to_ts(tsnow)
             self.tagAlerted()
-                
+
     def add_match(self, match):
         """ This function is called on all matching events. Rules use it to add
         extra information about the context of a match. Event is a dictionary
@@ -223,15 +250,15 @@ class PeriodicReporter(RuleType):
 
     def tagAlerted(self):
         for key in self.recordWindow.content.keys():
-            if key!= 'report_start':
+            if key!= 'report_start' and key!= 'last_report':
                 for ele in self.recordWindow.content[key]:
                     if not ele['Reported']:
-                        ele['Reported']=self.recordWindow.content['report_start']      
+                        ele['Reported']=self.recordWindow.content['last_report']      
 
     def garbage_collect(self, timestamp):
         """ Remove all occurrence data that is beyond the timeframe away """
         for key in self.recordWindow.content.keys():
-            if key!= 'report_start':
+            if key!='report_start' and key!='last_report':
                 stallEle = []
                 for ele in self.recordWindow.content[key]:
                     if ele['Reported']:
@@ -242,10 +269,12 @@ class PeriodicReporter(RuleType):
         self.recordWindow.write()
 
     def get_match_str(self, match):
-        lt = self.rules.get('use_local_time')
-        starttime = pretty_ts(dt_to_ts(ts_to_dt(match['Time']) - self.rules['timeframe']), lt)
-        endtime = pretty_ts(match['Time'], lt)
-        message = 'Report Period: [%s, %s]\n\n' % (starttime,endtime)
+        lt = True
+        starttime = pretty_dl_ts(match['Start Time'], lt)
+        endtime = pretty_dl_ts(match['End Time'], lt)
+        del match['Start Time']
+        del match['End Time']
+        message = 'Reporting Period: [%s, %s]\n\n' % (starttime,endtime)
        
         return message
 
@@ -312,3 +341,29 @@ class jsonReportInterface():
         except OSError as e:
             sys.stdout.write('Error writing to '+self.infoSrc+': '+str(e)+'\n')
         
+
+## You could use `tzlocal` module to get local timezone on Unix and Win32
+# from tzlocal import get_localzone # $ pip install tzlocal
+
+# # get local timezone    
+# local_tz = get_localzone()
+
+def utc_to_local(utc_dt):
+    local_tz = pytz.timezone('Asia/Hong_Kong')
+    local_dt = utc_dt.replace(tzinfo=pytz.utc).astimezone(local_tz)
+    return local_tz.normalize(local_dt).strftime('%Y-%m-%dT%H:%M:%S.%f%z')
+
+def pretty_dl_ts(utctimestamp, tz=True):
+    """Pretty-format the given timestamp (to be printed or logged hereafter).
+    If tz, the timestamp will be converted to local time.
+    Format: MM-DD HH:MM TZ"""
+    dt = utctimestamp
+    if not isinstance(dt, datetime.datetime):
+        dt = ts_to_dt(dt)
+    if tz:
+        dt = dt.replace(tzinfo=pytz.utc).astimezone(pytz.timezone('Asia/Hong_Kong'))
+    padding = ''
+    if dt.minute < 10:
+        padding = '0'
+    return "'%d-%d-%d %d:%s%d %s'" % (dt.year, dt.month, dt.day,
+                                 dt.hour, padding, dt.minute, dt.tzname())
